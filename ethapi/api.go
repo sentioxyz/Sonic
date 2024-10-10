@@ -58,6 +58,7 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/holiman/uint256"
+	"github.com/ethereum/go-ethereum/eth/tracers/sentio"
 )
 
 const (
@@ -2014,6 +2015,14 @@ func (api *PublicDebugAPI) BlocksTransactionTimes(ctx context.Context, untilBloc
 	return times, nil
 }
 
+// TraceConfig holds extra parameters to trace functions.
+type TraceConfig struct {
+	*vm.LogConfig
+	Tracer  *string
+	Timeout *string
+	Reexec  *uint64
+}
+
 // TraceTransaction returns the structured logs created during the execution of EVM
 // and returns them as a JSON object.
 func (api *PublicDebugAPI) TraceTransaction(ctx context.Context, hash common.Hash, config *tracers.TraceConfig) (interface{}, error) {
@@ -2096,7 +2105,20 @@ func (api *PublicDebugAPI) traceTx(ctx context.Context, tx *types.Transaction, m
 		return nil, fmt.Errorf("failed to get EVM for tracing: %w", err)
 	}
 
-	// Define a meaningful timeout of a single transaction trace
+	if *config.Tracer == "sentioTracer" {
+			tracer, err = sentio.NewSentioTracer(txctx, config.TracerConfig)
+			if err != nil {
+				return nil, err
+			}
+			break
+		}
+		if *config.Tracer == "sentioPrestateTracer" {
+			tracer, err = sentio.NewSentioPrestateTracer(txctx, config.TracerConfig)
+			if err != nil {
+				return nil, err
+			}
+			break
+		}// Define a meaningful timeout of a single transaction trace
 	if config.Timeout != nil {
 		if timeout, err = time.ParseDuration(*config.Timeout); err != nil {
 			return nil, err
@@ -2117,7 +2139,27 @@ func (api *PublicDebugAPI) traceTx(ctx context.Context, tx *types.Transaction, m
 	loggingStateDB.SetTxContext(txctx.TxHash, txctx.TxIndex)
 
 	// Run the transaction with tracing enabled.
-	_, err = evmcore.ApplyTransactionWithEVM(message, api.b.ChainConfig(), new(core.GasPool).AddGas(message.GasLimit), loggingStateDB, blockHeader.Number, txctx.BlockHash, tx, &usedGas, vmenv)
+	evmconfig := opera.DefaultVMConfig
+	evmconfig.Tracer = tracer
+	evmconfig.Debug = true
+	evmconfig.NoBaseFee = true
+	evmconfig.InterpreterImpl = "geth" // use always geth, as lfvm does not support tracing now
+	vmenv, _, err := api.b.GetEVM(ctx, message, statedb, blockHeader, &evmconfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get EVM for tracing: %w", err)
+	}
+
+	// Wait for the context to be done and cancel the evm. Even if the
+	// EVM has finished, cancelling may be done (repeatedly)
+	go func() {
+		<-ctx.Done()
+		vmenv.Cancel()
+	}()
+
+	// Call Prepare to clear out the statedb access list
+	statedb.Prepare(txctx.TxHash, txctx.TxIndex)
+
+	result, err := evmcore.ApplyMessage(vmenv, message, new(evmcore.GasPool).AddGas(message.Gas()))
 	if err != nil {
 		return nil, fmt.Errorf("tracing failed: %w", err)
 	}
@@ -2131,7 +2173,9 @@ func (api *PublicDebugAPI) traceTx(ctx context.Context, tx *types.Transaction, m
 		return nil, ErrMaxResponseSize
 	}
 
-	return result, nil
+	default:
+		return nil, fmt.Errorf("bad tracer type %T", tracer)
+	}
 }
 
 // txTraceResult is the result of a single transaction trace.
@@ -2432,4 +2476,186 @@ func toHexSlice(b []immutable.Bytes) []string {
 		r[i] = hexutil.Encode(b[i].ToBytes())
 	}
 	return r
+}
+
+func (api *PublicDebugAPI) TraceCall(ctx context.Context, args TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, config *TraceCallConfig) (interface{}, error) {
+	// Try to retrieve the specified block
+	var (
+		err     error
+		block   *evmcore.EvmBlock
+		statedb state.StateDB
+		//release StateReleaseFunc
+	)
+	if hash, ok := blockNrOrHash.Hash(); ok {
+		block, err = api.b.BlockByHash(ctx, hash)
+	} else if number, ok := blockNrOrHash.Number(); ok {
+		if number == rpc.PendingBlockNumber {
+			// We don't have access to the miner here. For tracing 'future' transactions,
+			// it can be done with block- and state-overrides instead, which offers
+			// more flexibility and stability than trying to trace on 'pending', since
+			// the contents of 'pending' is unstable and probably not a true representation
+			// of what the next actual block is likely to contain.
+			return nil, errors.New("tracing on top of pending is not supported")
+		}
+		block, err = api.b.BlockByNumber(ctx, number)
+	} else {
+		return nil, errors.New("invalid arguments; neither block nor hash specified")
+	}
+	if err != nil {
+		return nil, err
+	}
+	// try to recompute the state
+	//reexec := defaultTraceReexec
+	//if config != nil && config.Reexec != nil {
+	//	reexec = *config.Reexec
+	//}
+
+	if config != nil && config.TxIndex != nil {
+		_, statedb, err = api.stateAtTransaction(ctx, block, int(*config.TxIndex))
+	} else {
+		statedb, _, err = api.b.StateAndHeaderByNumberOrHash(ctx, blockNrOrHash)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer statedb.Release()
+
+	vmctx := evmcore.NewEVMBlockContext(block.Header(), api.b.ChainContext(), nil)
+	// Apply the customization rules if required.
+	if config != nil {
+		if err := config.StateOverrides.Apply(statedb); err != nil {
+			return nil, err
+		}
+		config.BlockOverrides.Apply(&vmctx)
+	}
+	// Execute the trace
+	msg, err := args.ToMessage(api.b.RPCGasCap(), vmctx.BaseFee)
+	if err != nil {
+		return nil, err
+	}
+
+	var traceConfig *TraceConfig
+	if config != nil {
+		traceConfig = &config.TraceConfig
+	}
+	txctx := &tracers.Context{
+		BlockHash: block.Hash,
+	}
+	return api.traceTx(ctx, msg, txctx, block.Header(), statedb, traceConfig)
+}
+
+type Bundle struct {
+	Transactions  []*TransactionArgs `json:"transactions"`
+	BlockOverride *BlockOverrides    `json:"blockOverride"`
+}
+
+type StateContext struct {
+	BlockNumber      *rpc.BlockNumberOrHash `json:"blockNumber"`
+	TransactionIndex int                    `json:"transactionIndex"`
+}
+
+type FailedTrace struct {
+	Failed string `json:"failed,omitempty"`
+}
+
+func (api *PublicDebugAPI) TraceCallMany(ctx context.Context, bundles []*Bundle, simulateContext *StateContext, config *TraceCallConfig) (interface{}, error) {
+	if len(bundles) == 0 {
+		return nil, errors.New("empty bundles")
+	}
+	var result []interface{}
+	for _, bundle := range bundles {
+		r, err := api.traceBundle(ctx, bundle, simulateContext, config)
+		if err != nil {
+			if r != nil {
+				// return partial results
+				r = append(r, &FailedTrace{Failed: err.Error()})
+				result = append(result, r)
+				return result, nil
+			}
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, nil
+}
+
+func (api *PublicDebugAPI) traceBundle(ctx context.Context, bundle *Bundle, simulateContext *StateContext, config *TraceCallConfig) ([]interface{}, error) {
+	var result []interface{}
+	// Try to retrieve the specified block
+	var (
+		err   error
+		block *evmcore.EvmBlock
+	)
+	if hash, ok := simulateContext.BlockNumber.Hash(); ok {
+		block, err = api.b.BlockByHash(ctx, hash)
+	} else if number, ok := simulateContext.BlockNumber.Number(); ok {
+		if number == rpc.PendingBlockNumber {
+			// We don't have access to the miner here. For tracing 'future' transactions,
+			// it can be done with block- and state-overrides instead, which offers
+			// more flexibility and stability than trying to trace on 'pending', since
+			// the contents of 'pending' is unstable and probably not a true representation
+			// of what the next actual block is likely to contain.
+			return nil, errors.New("tracing on top of pending is not supported")
+		}
+		block, err = api.b.BlockByNumber(ctx, number)
+	} else {
+		return nil, errors.New("invalid arguments; neither block nor hash specified")
+	}
+	if err != nil {
+		return nil, err
+	}
+	// try to recompute the state
+	//reexec := defaultTraceReexec
+	//if config != nil && config.Reexec != nil {
+	//	reexec = *config.Reexec
+	//}
+	//is158 := api.backend.ChainConfig().IsEIP158(block.Number())
+
+	if err != nil {
+		return nil, err
+	}
+	_, statedb, err := api.stateAtTransaction(ctx, block, simulateContext.TransactionIndex)
+	if err != nil {
+		return nil, err
+	}
+	vmctx := evmcore.NewEVMBlockContext(block.Header(), api.b.ChainContext(), nil)
+
+	defer statedb.Release()
+
+	// Apply the customization rules if required.
+	if config != nil {
+		if err := config.StateOverrides.Apply(statedb); err != nil {
+			return nil, err
+		}
+		config.BlockOverrides.Apply(&vmctx)
+	}
+	// Execute the trace
+	for idx, args := range bundle.Transactions {
+		if args.Gas == nil {
+			gasCap := api.b.RPCGasCap()
+			args.Gas = (*hexutil.Uint64)(&gasCap)
+		}
+		msg, err := args.ToMessage(api.b.RPCGasCap(), block.BaseFee)
+		if err != nil {
+			return result, err
+		}
+
+		var traceConfig *TraceConfig
+		if config != nil {
+			traceConfig = &config.TraceConfig
+		}
+
+		txctx := &tracers.Context{
+			BlockHash: block.Hash,
+			TxIndex:   simulateContext.TransactionIndex + idx,
+		}
+
+		r, err := api.traceTx(ctx, msg, txctx, block.Header(), statedb, traceConfig)
+		if err != nil {
+			return result, err
+		}
+		result = append(result, r)
+		statedb.Finalise()
+	}
+	return result, nil
 }

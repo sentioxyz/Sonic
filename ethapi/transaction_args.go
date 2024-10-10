@@ -32,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 
 	"github.com/Fantom-foundation/go-opera/gossip/gasprice"
+	"github.com/ethereum/go-ethereum/core/vm"
 )
 
 // TransactionArgs represents the arguments to construct a new transaction
@@ -294,4 +295,44 @@ func (args *TransactionArgs) toTransaction() *types.Transaction {
 // This assumes that setDefaults has been called.
 func (args *TransactionArgs) ToTransaction() *types.Transaction {
 	return args.toTransaction()
+}
+
+// BlockOverrides is a set of header fields to override.
+type BlockOverrides struct {
+	Number     *hexutil.Big
+	Difficulty *hexutil.Big
+	Time       *hexutil.Uint64
+	GasLimit   *hexutil.Uint64
+	Coinbase   *common.Address
+	//Random      *common.Hash
+	BaseFee *hexutil.Big
+	//BlobBaseFee *hexutil.Big
+}
+
+// Apply overrides the given header fields into the given block context.
+func (diff *BlockOverrides) Apply(blockCtx *vm.BlockContext) {
+	if diff == nil {
+		return
+	}
+	if diff.Number != nil {
+		blockCtx.BlockNumber = diff.Number.ToInt()
+	}
+	if diff.Difficulty != nil {
+		blockCtx.Difficulty = diff.Difficulty.ToInt()
+	}
+	if diff.Time != nil {
+		blockCtx.Time = big.NewInt(int64(*diff.Time))
+	}
+	if diff.GasLimit != nil {
+		blockCtx.GasLimit = uint64(*diff.GasLimit)
+	}
+	if diff.Coinbase != nil {
+		blockCtx.Coinbase = *diff.Coinbase
+	}
+	//if diff.Random != nil {
+	//	blockCtx.Random = diff.Random
+	//}
+	if diff.BaseFee != nil {
+		blockCtx.BaseFee = diff.BaseFee.ToInt()
+	}
 }

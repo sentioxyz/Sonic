@@ -90,6 +90,7 @@ type Backend interface {
 
 	ChainConfig() *params.ChainConfig
 	CurrentBlock() *evmcore.EvmBlock
+	ChainContext() evmcore.DummyChain
 
 	// Lachesis DAG API
 	GetEventPayload(ctx context.Context, shortEventID string) (*inter.EventPayload, error)
