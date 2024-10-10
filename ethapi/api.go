@@ -2045,13 +2045,13 @@ func (api *PublicDebugAPI) TraceTransaction(ctx context.Context, hash common.Has
 		TxHash:      hash,
 	}
 
-	return api.traceTx(ctx, tx, msg, txctx, block.Header(), statedb, config)
+	return api.traceTx(ctx, tx, msg, txctx, block.Header(), statedb, config, nil)
 }
 
 // traceTx configures a new tracer according to the provided configuration, and
 // executes the given message in the provided environment. The return value will
 // be tracer dependent.
-func (api *PublicDebugAPI) traceTx(ctx context.Context, tx *types.Transaction, message *core.Message, txctx *tracers.Context, blockHeader *evmcore.EvmHeader, statedb state.StateDB, config *tracers.TraceConfig) (json.RawMessage, error) {
+func (api *PublicDebugAPI) traceTx(ctx context.Context, tx *types.Transaction, message *core.Message, txctx *tracers.Context, blockHeader *evmcore.EvmHeader, statedb state.StateDB, config *tracers.TraceConfig, blockOverrides *BlockOverrides) (json.RawMessage, error) {
 	var (
 		tracer  *tracers.Tracer
 		err     error
@@ -2094,6 +2094,10 @@ func (api *PublicDebugAPI) traceTx(ctx context.Context, tx *types.Transaction, m
 	vmenv, _, err := api.b.GetEVM(ctx, message, loggingStateDB, blockHeader, &evmconfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get EVM for tracing: %w", err)
+	}
+
+	if blockOverrides != nil {
+		blockOverrides.Apply(&vmenv.Context)
 	}
 
 	// Define a meaningful timeout of a single transaction trace
@@ -2194,7 +2198,7 @@ func (api *PublicDebugAPI) traceBlock(ctx context.Context, block *evmcore.EvmBlo
 			TxIndex:     i,
 			TxHash:      tx.Hash(),
 		}
-		res, err := api.traceTx(ctx, tx, msg, txctx, block.Header(), statedb, config)
+		res, err := api.traceTx(ctx, tx, msg, txctx, block.Header(), statedb, config, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -2311,7 +2315,7 @@ func (api *PublicDebugAPI) TraceCall(ctx context.Context, args TransactionArgs, 
 		traceConfig = &config.TraceConfig
 	}
 
-	return api.traceTx(ctx, tx, msg, new(tracers.Context), &block.EvmHeader, statedb, traceConfig)
+	return api.traceTx(ctx, tx, msg, new(tracers.Context), &block.EvmHeader, statedb, traceConfig, nil)
 }
 
 // getEvmBlockFromNumberOrHash returns EvmBlock from block number or block hash
@@ -2432,4 +2436,148 @@ func toHexSlice(b []immutable.Bytes) []string {
 		r[i] = hexutil.Encode(b[i].ToBytes())
 	}
 	return r
+}
+
+// BlockOverrides is a set of header fields to override.
+// copy from ethapi.internal
+type BlockOverrides struct {
+	Number      *hexutil.Big
+	Difficulty  *hexutil.Big
+	Time        *hexutil.Uint64
+	GasLimit    *hexutil.Uint64
+	Coinbase    *common.Address
+	Random      *common.Hash
+	BaseFee     *hexutil.Big
+	BlobBaseFee *hexutil.Big
+}
+
+// Apply overrides the given header fields into the given block context.
+func (diff *BlockOverrides) Apply(blockCtx *vm.BlockContext) {
+	if diff == nil {
+		return
+	}
+	if diff.Number != nil {
+		blockCtx.BlockNumber = diff.Number.ToInt()
+	}
+	if diff.Difficulty != nil {
+		blockCtx.Difficulty = diff.Difficulty.ToInt()
+	}
+	if diff.Time != nil {
+		blockCtx.Time = uint64(*diff.Time)
+	}
+	if diff.GasLimit != nil {
+		blockCtx.GasLimit = uint64(*diff.GasLimit)
+	}
+	if diff.Coinbase != nil {
+		blockCtx.Coinbase = *diff.Coinbase
+	}
+	if diff.Random != nil {
+		blockCtx.Random = diff.Random
+	}
+	if diff.BaseFee != nil {
+		blockCtx.BaseFee = diff.BaseFee.ToInt()
+	}
+	if diff.BlobBaseFee != nil {
+		blockCtx.BlobBaseFee = diff.BlobBaseFee.ToInt()
+	}
+}
+
+type Bundle struct {
+	Transactions  []*TransactionArgs `json:"transactions"`
+	BlockOverride *BlockOverrides    `json:"blockOverride"`
+}
+
+type StateContext struct {
+	BlockNumber      *rpc.BlockNumberOrHash `json:"blockNumber"`
+	TransactionIndex int                    `json:"transactionIndex"`
+}
+
+type FailedTrace struct {
+	Failed string `json:"failed,omitempty"`
+}
+
+func (api *PublicDebugAPI) TraceCallMany(ctx context.Context, bundles []*Bundle, simulateContext *StateContext, config *TraceCallConfig) (interface{}, error) {
+	if len(bundles) == 0 {
+		return nil, errors.New("empty bundles")
+	}
+	var result []interface{}
+	for _, bundle := range bundles {
+		r, err := api.traceBundle(ctx, bundle, simulateContext, config)
+		if err != nil {
+			if r != nil {
+				// return partial results
+				r = append(r, &FailedTrace{Failed: err.Error()})
+				result = append(result, r)
+				return result, nil
+			}
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, nil
+}
+
+func (api *PublicDebugAPI) traceBundle(ctx context.Context, bundle *Bundle, simulateContext *StateContext, config *TraceCallConfig) ([]interface{}, error) {
+	var result []interface{}
+
+	blockNrOrHash := simulateContext.BlockNumber
+	// If pending block, return error
+	if num, ok := blockNrOrHash.Number(); ok && num == rpc.PendingBlockNumber {
+		return nil, errors.New("tracing on top of pending is not supported")
+	}
+
+	// Get block
+	block, err := getEvmBlockFromNumberOrHash(ctx, *blockNrOrHash, api.b)
+	if err != nil {
+		return nil, err
+	}
+
+	var txIndex uint
+	if config != nil && config.TxIndex != nil {
+		txIndex = uint(*config.TxIndex)
+	}
+
+	// Get state
+	_, statedb, err := stateAtTransaction(ctx, block, int(txIndex), api.b)
+	if err != nil {
+		return nil, err
+	}
+	defer statedb.Release()
+
+	// Apply state overrides
+	if config != nil {
+		if err := config.StateOverrides.Apply(statedb); err != nil {
+			return nil, err
+		}
+	}
+
+	// Execute the trace
+	for idx, args := range bundle.Transactions {
+		if args.Gas == nil {
+			gasCap := api.b.RPCGasCap()
+			args.Gas = (*hexutil.Uint64)(&gasCap)
+		}
+		msg, err := args.ToMessage(api.b.RPCGasCap(), block.BaseFee)
+		if err != nil {
+			return result, err
+		}
+
+		var traceConfig *tracers.TraceConfig
+		if config != nil {
+			traceConfig = &config.TraceConfig
+		}
+
+		txctx := &tracers.Context{
+			BlockHash: block.Hash,
+			TxIndex:   simulateContext.TransactionIndex + idx,
+		}
+
+		r, err := api.traceTx(ctx, args.ToTransaction(), msg, txctx, block.Header(), statedb, traceConfig, bundle.BlockOverride)
+		if err != nil {
+			return result, err
+		}
+		result = append(result, r)
+		statedb.Finalise()
+	}
+	return result, nil
 }
