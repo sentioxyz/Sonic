@@ -117,6 +117,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/ethereum/go-ethereum => github.com/Fantom-foundation/go-ethereum-substate v1.1.1-0.20240814103603-fd3f24371804
+replace github.com/ethereum/go-ethereum => github.com/sentioxyz/go-ethereum-substate v0.0.0-20241015100314-96db0ad202fe
 
 replace github.com/dvyukov/go-fuzz => github.com/guzenok/go-fuzz v0.0.0-20210201043429-a8e90a2a4f88
