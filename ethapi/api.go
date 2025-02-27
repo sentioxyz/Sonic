@@ -2167,10 +2167,6 @@ func (api *PublicDebugAPI) traceTx(ctx context.Context, tx *types.Transaction, m
 		return nil, fmt.Errorf("failed to get EVM for tracing: %w", err)
 	}
 
-	if blockOverrides != nil {
-		blockOverrides.Apply(&vmenv.Context)
-	}
-
 	// Define a meaningful timeout of a single transaction trace
 	if config.Timeout != nil {
 		if timeout, err = time.ParseDuration(*config.Timeout); err != nil {
@@ -2519,50 +2515,6 @@ func toHexSlice(b []immutable.Bytes) []string {
 	return r
 }
 
-// BlockOverrides is a set of header fields to override.
-// copy from ethapi.internal
-type BlockOverrides struct {
-	Number      *hexutil.Big
-	Difficulty  *hexutil.Big
-	Time        *hexutil.Uint64
-	GasLimit    *hexutil.Uint64
-	Coinbase    *common.Address
-	Random      *common.Hash
-	BaseFee     *hexutil.Big
-	BlobBaseFee *hexutil.Big
-}
-
-// Apply overrides the given header fields into the given block context.
-func (diff *BlockOverrides) Apply(blockCtx *vm.BlockContext) {
-	if diff == nil {
-		return
-	}
-	if diff.Number != nil {
-		blockCtx.BlockNumber = diff.Number.ToInt()
-	}
-	if diff.Difficulty != nil {
-		blockCtx.Difficulty = diff.Difficulty.ToInt()
-	}
-	if diff.Time != nil {
-		blockCtx.Time = uint64(*diff.Time)
-	}
-	if diff.GasLimit != nil {
-		blockCtx.GasLimit = uint64(*diff.GasLimit)
-	}
-	if diff.Coinbase != nil {
-		blockCtx.Coinbase = *diff.Coinbase
-	}
-	if diff.Random != nil {
-		blockCtx.Random = diff.Random
-	}
-	if diff.BaseFee != nil {
-		blockCtx.BaseFee = diff.BaseFee.ToInt()
-	}
-	if diff.BlobBaseFee != nil {
-		blockCtx.BlobBaseFee = diff.BlobBaseFee.ToInt()
-	}
-}
-
 type Bundle struct {
 	Transactions  []*TransactionArgs `json:"transactions"`
 	BlockOverride *BlockOverrides    `json:"blockOverride"`
@@ -2653,12 +2605,17 @@ func (api *PublicDebugAPI) traceBundle(ctx context.Context, bundle *Bundle, simu
 			TxIndex:   simulateContext.TransactionIndex + idx,
 		}
 
-		r, err := api.traceTx(ctx, args.ToTransaction(), msg, txctx, block.Header(), statedb, traceConfig, bundle.BlockOverride)
+		blockCtx := getBlockContext(ctx, api.b, &block.EvmHeader)
+		if bundle.BlockOverride != nil {
+			bundle.BlockOverride.apply(&blockCtx)
+		}
+
+		r, err := api.traceTx(ctx, args.ToTransaction(), msg, txctx, block.Header(), statedb, traceConfig, &blockCtx)
 		if err != nil {
 			return result, err
 		}
 		result = append(result, r)
-		statedb.Finalise()
+		statedb.Finalise(false)
 	}
 	return result, nil
 }
