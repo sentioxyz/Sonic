@@ -2586,13 +2586,9 @@ func (api *PublicDebugAPI) traceBundle(ctx context.Context, bundle *Bundle, simu
 
 	// Execute the trace
 	for idx, args := range bundle.Transactions {
-		if args.Gas == nil {
-			gasCap := api.b.RPCGasCap()
-			args.Gas = (*hexutil.Uint64)(&gasCap)
-		}
-		msg, err := args.ToMessage(api.b.RPCGasCap(), block.BaseFee)
+		tx, msg, err := getTxAndMessage(args, block, api.b)
 		if err != nil {
-			return result, err
+			return nil, err
 		}
 
 		var traceConfig *tracers.TraceConfig
@@ -2610,7 +2606,7 @@ func (api *PublicDebugAPI) traceBundle(ctx context.Context, bundle *Bundle, simu
 			bundle.BlockOverride.apply(&blockCtx)
 		}
 
-		r, err := api.traceTx(ctx, args.ToTransaction(), msg, txctx, block.Header(), statedb, traceConfig, &blockCtx)
+		r, err := api.traceTx(ctx, tx, msg, txctx, block.Header(), statedb, traceConfig, &blockCtx)
 		if err != nil {
 			return result, err
 		}
